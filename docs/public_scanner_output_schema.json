@@ -1,0 +1,606 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wafstat.example.invalid/schemas/public-scanner-output-v0.4.json",
+  "title": "WAFstat public scanner output",
+  "description": "Bodyless, marker-safe dry-run or live verdict output for the WAFstat public scanner. Raw marker values, response bodies, and full marker-bearing URLs are intentionally not represented.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRunPlan"
+    },
+    {
+      "$ref": "#/$defs/liveVerdict"
+    }
+  ],
+  "$defs": {
+    "requestHeaders": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "User-Agent",
+        "Accept",
+        "Accept-Encoding",
+        "Connection"
+      ],
+      "properties": {
+        "User-Agent": {
+          "type": "string",
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\r\\n]"
+          }
+        },
+        "Accept": {
+          "const": "*/*"
+        },
+        "Accept-Encoding": {
+          "const": "identity"
+        },
+        "Connection": {
+          "const": "close"
+        }
+      }
+    },
+    "redirectEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "from",
+        "to"
+      ],
+      "properties": {
+        "status": {
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 399
+        },
+        "from": {
+          "type": "string",
+          "description": "Sanitized URL without query, fragment, credentials, or a raw/repeatedly URL-encoded marker-bearing path."
+        },
+        "to": {
+          "type": "string",
+          "description": "Sanitized URL without query, fragment, credentials, or a raw/repeatedly URL-encoded marker-bearing path."
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "marker_id",
+        "marker_category",
+        "marker_value_hash",
+        "status_code",
+        "response_headers_subset",
+        "body_length",
+        "body_sha256",
+        "final_url",
+        "redirect_chain",
+        "warnings"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "baseline",
+            "marker"
+          ]
+        },
+        "marker_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(sqli|xss|traversal)_[0-9]{3}$"
+        },
+        "marker_category": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "sqli_marker",
+            "xss_marker",
+            "traversal_marker",
+            null
+          ]
+        },
+        "marker_value_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "status_code": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "response_headers_subset": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "server": {"type": "string"},
+            "content-type": {"type": "string"},
+            "content-length": {"type": "string"},
+            "cache-control": {"type": "string"},
+            "location": {"type": "string"},
+            "via": {"type": "string"},
+            "x-cache": {"type": "string"},
+            "x-cache-status": {"type": "string"},
+            "cf-cache-status": {"type": "string"},
+            "cf-mitigated": {"type": "string"},
+            "retry-after": {"const": "[present]"},
+            "www-authenticate": {"const": "[present]"}
+          },
+          "description": "Curated lower-case response-header subset. `Location` values have query and fragment removed and marker-bearing paths redacted; `WWW-Authenticate` and `Retry-After` are represented only as `[present]`."
+        },
+        "body_length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "body_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "final_url": {
+          "type": "string",
+          "description": "Sanitized final URL without query, fragment, credentials, or a raw/repeatedly URL-encoded marker-bearing path."
+        },
+        "redirect_chain": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/redirectEntry"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": {"kind": {"const": "baseline"}}
+          },
+          "then": {
+            "properties": {
+              "marker_id": {"const": null},
+              "marker_category": {"const": null},
+              "marker_value_hash": {"const": null}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": {"kind": {"const": "marker"}}
+          },
+          "then": {
+            "properties": {
+              "marker_id": {"type": "string", "pattern": "^(sqli|xss|traversal)_[0-9]{3}$"},
+              "marker_category": {"enum": ["sqli_marker", "xss_marker", "traversal_marker"]},
+              "marker_value_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }
+        }
+      ]
+    },
+    "markerIdList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(sqli|xss|traversal)_[0-9]{3}$"
+      }
+    },
+    "markerAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marker_id", "marker_category", "observed_action"],
+      "properties": {
+        "marker_id": {"type": "string", "pattern": "^(sqli|xss|traversal)_[0-9]{3}$"},
+        "marker_category": {"enum": ["sqli_marker", "xss_marker", "traversal_marker"]},
+        "observed_action": {"enum": ["BLOCK", "CHALLENGE", "PASS_THROUGH", "OTHER"]}
+      }
+    },
+    "evidenceBasis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uses_private_configuration",
+        "uses_provider_api",
+        "uses_origin_logs",
+        "baseline_source",
+        "classification_signals",
+        "audit_metadata_not_used_for_verdict",
+        "block_signal_policy"
+      ],
+      "properties": {
+        "uses_private_configuration": {"const": false},
+        "uses_provider_api": {"const": false},
+        "uses_origin_logs": {"const": false},
+        "baseline_source": {"const": "same_scan_benign_probes_following_bounded_redirect_policy"},
+        "classification_signals": {
+          "const": [
+            "status_code",
+            "cf_mitigated_header",
+            "same_scan_baseline_status",
+            "redirect_integrity",
+            "transport_completion"
+          ]
+        },
+        "audit_metadata_not_used_for_verdict": {
+          "const": ["body_length", "body_sha256"]
+        },
+        "block_signal_policy": {
+          "const": "http_403_without_challenge_auth_retry_or_login_header"
+        }
+      }
+    },
+    "enforcementThreshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_strong_markers", "marker_count"],
+      "properties": {
+        "minimum_strong_markers": {"const": 8},
+        "marker_count": {"const": 9}
+      }
+    },
+    "common": {
+      "type": "object",
+      "required": [
+        "tool",
+        "tool_version",
+        "timestamp_utc",
+        "target",
+        "authorized_use_notice",
+        "redirect_policy",
+        "follow_cross_host_redirects",
+        "blocked_redirect",
+        "marker_corpus_version",
+        "corpus_sha256",
+        "request_headers_intended"
+      ],
+      "properties": {
+        "tool": {
+          "const": "WAFstat-Scanner"
+        },
+        "tool_version": {
+          "const": "0.4"
+        },
+        "timestamp_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "target": {
+          "type": "string"
+        },
+        "authorized_use_notice": {
+          "type": "string",
+          "minLength": 1
+        },
+        "redirect_policy": {
+          "enum": [
+            "same-host-only",
+            "follow-cross-host"
+          ]
+        },
+        "follow_cross_host_redirects": {
+          "type": "boolean"
+        },
+        "blocked_redirect": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/redirectEntry"
+            }
+          ]
+        },
+        "marker_corpus_version": {
+          "const": "fixed_marker_matrix_v1"
+        },
+        "corpus_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "request_headers_intended": {
+          "$ref": "#/$defs/requestHeaders"
+        }
+      }
+    },
+    "dryRunPlan": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/common"
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode",
+            "network_activity",
+            "marker_count",
+            "marker_ids",
+            "marker_categories",
+            "baseline_repetitions",
+            "planned_request_count",
+            "maximum_transport_requests",
+            "request_profile",
+            "marker_parameter_name",
+            "marker_placement",
+            "timeout_seconds",
+            "max_redirects",
+            "enforcement_threshold",
+            "evidence_basis",
+            "scope_warning"
+          ],
+          "properties": {
+            "mode": {
+              "const": "dry-run"
+            },
+            "network_activity": {
+              "const": "none"
+            },
+            "marker_count": {
+              "const": 9
+            },
+            "marker_ids": {
+              "type": "array",
+              "minItems": 9,
+              "maxItems": 9,
+              "items": {
+                "type": "string",
+                "pattern": "^(sqli|xss|traversal)_[0-9]{3}$"
+              }
+            },
+            "marker_categories": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {
+                "enum": [
+                  "sqli_marker",
+                  "xss_marker",
+                  "traversal_marker"
+                ]
+              }
+            },
+            "baseline_repetitions": {
+              "const": 3
+            },
+            "planned_request_count": {
+              "const": 12
+            },
+            "maximum_transport_requests": {
+              "const": 72,
+              "description": "Maximum underlying HTTP transport calls if every logical probe traverses all five allowed redirects."
+            },
+            "request_profile": {
+              "const": "WAFstat-Scanner/0.4-default"
+            },
+            "marker_parameter_name": {
+              "const": "wafstat_marker"
+            },
+            "marker_placement": {
+              "const": "query_parameter"
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "max_redirects": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "enforcement_threshold": {
+              "$ref": "#/$defs/enforcementThreshold"
+            },
+            "evidence_basis": {
+              "$ref": "#/$defs/evidenceBasis"
+            },
+            "scope_warning": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "liveVerdict": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/common"
+        },
+        {
+          "type": "object",
+          "required": [
+            "baseline_repetitions",
+            "marker_count",
+            "enforcement_posture",
+            "observed_enforcement_action",
+            "verdict",
+            "strong_signal_count",
+            "pass_through_count",
+            "action_counts",
+            "marker_actions",
+            "marker_ids_by_action",
+            "enforcement_threshold",
+            "evidence_basis",
+            "baseline_summary",
+            "evidence_summary",
+            "human_summary",
+            "scope_warning",
+            "warnings",
+            "error_kind",
+            "observations"
+          ],
+          "properties": {
+            "baseline_repetitions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "marker_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            },
+            "enforcement_posture": {
+              "enum": [
+                "ENFORCED",
+                "NOT_ENFORCED_OBSERVED",
+                "INCONCLUSIVE"
+              ]
+            },
+            "observed_enforcement_action": {
+              "enum": [
+                "BLOCK",
+                "CHALLENGE",
+                "PASS_THROUGH",
+                "MIXED",
+                "RUNTIME_FAILURE"
+              ]
+            },
+            "verdict": {
+              "type": "string",
+              "pattern": "^(ENFORCED|NOT_ENFORCED_OBSERVED|INCONCLUSIVE) / (BLOCK|CHALLENGE|PASS_THROUGH|MIXED|RUNTIME_FAILURE)$"
+            },
+            "strong_signal_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            },
+            "pass_through_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            },
+            "action_counts": {
+              "type": "object",
+              "additionalProperties": false,
+              "propertyNames": {
+                "enum": ["BLOCK", "CHALLENGE", "PASS_THROUGH", "OTHER"]
+              },
+              "properties": {
+                "BLOCK": {"type": "integer", "minimum": 0},
+                "CHALLENGE": {"type": "integer", "minimum": 0},
+                "PASS_THROUGH": {"type": "integer", "minimum": 0},
+                "OTHER": {"type": "integer", "minimum": 0}
+              }
+            },
+            "marker_actions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/markerAction"
+              }
+            },
+            "marker_ids_by_action": {
+              "type": "object",
+              "additionalProperties": false,
+              "propertyNames": {
+                "enum": ["BLOCK", "CHALLENGE", "PASS_THROUGH", "OTHER"]
+              },
+              "properties": {
+                "BLOCK": {"$ref": "#/$defs/markerIdList"},
+                "CHALLENGE": {"$ref": "#/$defs/markerIdList"},
+                "PASS_THROUGH": {"$ref": "#/$defs/markerIdList"},
+                "OTHER": {"$ref": "#/$defs/markerIdList"}
+              }
+            },
+            "enforcement_threshold": {
+              "$ref": "#/$defs/enforcementThreshold"
+            },
+            "evidence_basis": {
+              "$ref": "#/$defs/evidenceBasis"
+            },
+            "baseline_summary": {
+              "type": "string"
+            },
+            "evidence_summary": {
+              "type": "string"
+            },
+            "human_summary": {
+              "type": "string"
+            },
+            "scope_warning": {
+              "type": "string"
+            },
+            "warnings": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "error_kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observations": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/observation"
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["enforcement_posture"],
+                "properties": {"enforcement_posture": {"const": "ENFORCED"}}
+              },
+              "then": {
+                "properties": {
+                  "observed_enforcement_action": {"enum": ["BLOCK", "CHALLENGE", "MIXED"]},
+                  "error_kind": {"const": null}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["enforcement_posture"],
+                "properties": {"enforcement_posture": {"const": "NOT_ENFORCED_OBSERVED"}}
+              },
+              "then": {
+                "properties": {
+                  "observed_enforcement_action": {"const": "PASS_THROUGH"},
+                  "error_kind": {"const": null}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["enforcement_posture"],
+                "properties": {"enforcement_posture": {"const": "INCONCLUSIVE"}}
+              },
+              "then": {
+                "properties": {
+                  "observed_enforcement_action": {"enum": ["MIXED", "RUNTIME_FAILURE"]}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["observed_enforcement_action"],
+                "properties": {"observed_enforcement_action": {"const": "RUNTIME_FAILURE"}}
+              },
+              "then": {
+                "properties": {"error_kind": {"type": "string", "minLength": 1}}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

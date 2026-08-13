@@ -1,0 +1,35 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local virtual environments
+.venv/
+.venv-security/
+.venv-semgrep/
+venv/
+
+# Downloaded local security tool binaries (reinstall via docs/tools)
+/tools/gitleaks
+
+# Local scanner output and security reports
+*.jsonl
+*.sarif
+coverage.xml
+.coverage
+htmlcov/
+
+# Secrets and local environment
+.env
+.env.*
+*.secret
+*.token
+*.pem
+*.key
+
+# Editors and OS
+.DS_Store
+*.swp
+*.tmp

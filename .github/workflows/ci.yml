@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install development dependencies
+        run: python -m pip install --require-hashes -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest tests/test_public_wafstat_scanner.py -q
+      - name: Compile sources
+        run: python -m py_compile wafstat tests/test_public_wafstat_scanner.py scripts/validate_examples.py
+      - name: Validate schema examples
+        run: python scripts/validate_examples.py
+      - name: Check patch whitespace
+        run: git diff --check
+
+  security-static:
+    name: Security static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Install security tooling
+        run: python -m pip install --require-hashes -r requirements-security.txt
+      - name: Install Semgrep environment
+        run: |
+          python -m venv .venv-semgrep
+          .venv-semgrep/bin/python -m pip install --require-hashes -r requirements-semgrep.txt
+      - name: Run Ruff scanner rules
+        run: ruff check --select F,I,B,S wafstat
+      - name: Run Ruff test/helper rules
+        run: ruff check --select F,I,B tests scripts
+      - name: Run Bandit
+        run: bandit -r wafstat tests scripts -ll -ii
+      - name: Run pip-audit
+        run: pip-audit -r requirements-security.txt --progress-spinner off
+      - name: Audit Semgrep lock
+        run: pip-audit -r requirements-semgrep.txt --progress-spinner off
+      - name: Run Semgrep
+        run: >-
+          .venv-semgrep/bin/semgrep scan --config p/python --config p/security-audit
+          --exclude .git --exclude .venv --exclude .venv-security
+          --exclude .venv-semgrep --exclude .pytest_cache --exclude .ruff_cache
+          --exclude tools --metrics=off .

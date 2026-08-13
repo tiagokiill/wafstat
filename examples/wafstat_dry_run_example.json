@@ -1,0 +1,68 @@
+{
+  "authorized_use_notice": "Use only on systems you own or are explicitly authorized to assess. The operator is responsible for the supplied target and every redirect destination they choose to follow.",
+  "baseline_repetitions": 3,
+  "blocked_redirect": null,
+  "corpus_sha256": "caef936af8712d48c49305635b4063e123ec964fc2456bfe4991c101d34f1d26",
+  "enforcement_threshold": {
+    "marker_count": 9,
+    "minimum_strong_markers": 8
+  },
+  "evidence_basis": {
+    "audit_metadata_not_used_for_verdict": [
+      "body_length",
+      "body_sha256"
+    ],
+    "baseline_source": "same_scan_benign_probes_following_bounded_redirect_policy",
+    "block_signal_policy": "http_403_without_challenge_auth_retry_or_login_header",
+    "classification_signals": [
+      "status_code",
+      "cf_mitigated_header",
+      "same_scan_baseline_status",
+      "redirect_integrity",
+      "transport_completion"
+    ],
+    "uses_origin_logs": false,
+    "uses_private_configuration": false,
+    "uses_provider_api": false
+  },
+  "follow_cross_host_redirects": false,
+  "marker_categories": [
+    "sqli_marker",
+    "xss_marker",
+    "traversal_marker"
+  ],
+  "marker_corpus_version": "fixed_marker_matrix_v1",
+  "marker_count": 9,
+  "marker_ids": [
+    "sqli_001",
+    "sqli_002",
+    "sqli_003",
+    "xss_001",
+    "xss_002",
+    "xss_003",
+    "traversal_001",
+    "traversal_002",
+    "traversal_003"
+  ],
+  "marker_parameter_name": "wafstat_marker",
+  "marker_placement": "query_parameter",
+  "max_redirects": 5,
+  "maximum_transport_requests": 72,
+  "mode": "dry-run",
+  "network_activity": "none",
+  "planned_request_count": 12,
+  "redirect_policy": "same-host-only",
+  "request_headers_intended": {
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Connection": "close",
+    "User-Agent": "WAFstat-Scanner/0.4"
+  },
+  "request_profile": "WAFstat-Scanner/0.4-default",
+  "scope_warning": "WAFstat checks externally observable enforcement consequence for marker traffic. It does not detect WAF presence and does not infer private WAF internal state. Origin-like pass-through cannot distinguish detect-only from no-WAF.",
+  "target": "https://example.com/",
+  "timeout_seconds": 10.0,
+  "timestamp_utc": "2026-08-13T17:21:54Z",
+  "tool": "WAFstat-Scanner",
+  "tool_version": "0.4"
+}

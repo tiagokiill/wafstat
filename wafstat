@@ -1,0 +1,1313 @@
+#!/usr/bin/env python3
+"""WAFstat live enforcement-verification scanner (public single-file tool).
+
+WAFstat answers exactly one question for a target the operator is authorized to
+test: if a WAF is present on this request path, does the fixed marker corpus
+produce externally observable enforcement (block or challenge), origin-like
+pass-through, or inconclusive evidence?
+
+It is NOT a WAF fingerprinting or presence-detection tool. It does not attempt
+bypass, evasion, payload mutation, or discovery. Because detect-only and no-WAF
+are externally identical for allowed marker traffic, WAFstat never claims WAF
+presence and never asserts private/internal WAF state. A pass-through result is
+reported conditionally ("if a WAF is present, consistent with detect-only").
+
+The tool is pure standard-library Python 3.11+. ``scan`` is the deliberate live
+operation; ``--dry-run`` prints a no-traffic plan. Raw marker values are never
+printed or persisted; saved output is bodyless and marker-safe.
+
+This file is a purpose-written extraction of the live-scan path adapted from the
+frozen WAFstat research repo (marker corpus and request profile from
+``src/marker_corpus.py`` / ``src/collector.py``; conservative verdict wording
+from ``src/wafstat.py``). The research repo's batch baseline and
+error-as-enforcement behavior are intentionally NOT ported.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Mapping, Sequence
+
+TOOL_NAME = "WAFstat-Scanner"
+TOOL_VERSION = "0.4"
+
+# --- Marker corpus (copied/adapted from src/marker_corpus.py) ---------------
+#
+# The 9 markers are trivial, well-known WAF-testing marker strings. They ship in
+# source (standard for WAF-testing tools) but are NEVER printed or persisted.
+
+MARKER_CORPUS_VERSION = "fixed_marker_matrix_v1"
+MARKER_PARAMETER_NAME = "wafstat_marker"
+MARKER_PLACEMENT = "query_parameter"
+BENIGN_BASELINE_VALUE = "wafstat_benign_baseline"
+
+Marker = collections.namedtuple("Marker", ["marker_id", "marker_category", "marker_value"])
+
+MARKERS: tuple[Marker, ...] = (
+    Marker("sqli_001", "sqli_marker", "' OR '1'='1"),
+    Marker("sqli_002", "sqli_marker", "UNION SELECT NULL"),
+    Marker("sqli_003", "sqli_marker", "1; SELECT 1"),
+    Marker("xss_001", "xss_marker", "<script>alert(1)</script>"),
+    Marker("xss_002", "xss_marker", "<img src=x onerror=alert(1)>"),
+    Marker("xss_003", "xss_marker", "javascript:alert(1)"),
+    Marker("traversal_001", "traversal_marker", "../wafstat_canary.txt"),
+    Marker("traversal_002", "traversal_marker", "../../../../wafstat_canary.txt"),
+    Marker("traversal_003", "traversal_marker", "..\\..\\wafstat_canary.ini"),
+)
+
+MARKER_CATEGORIES = ("sqli_marker", "xss_marker", "traversal_marker")
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_corpus_json() -> str:
+    """Deterministic JSON matching src/marker_corpus.canonical_corpus_json()."""
+
+    return json.dumps(
+        [
+            {
+                "marker_id": marker.marker_id,
+                "marker_category": marker.marker_category,
+                "marker_value": marker.marker_value,
+            }
+            for marker in MARKERS
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+MARKER_CORPUS_SHA256 = _sha256_text(_canonical_corpus_json())
+
+
+def _marker_value_hash(marker: Marker) -> str:
+    return _sha256_text(marker.marker_value)
+
+
+# --- Safety caps and request profile ----------------------------------------
+
+DEFAULT_USER_AGENT = "WAFstat-Scanner/0.4"
+DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_BASELINE_REPETITIONS = 3
+MAX_REDIRECTS = 5
+# Hard cap on response body bytes retained for hashing/analysis. Prevents a
+# hostile or oversized response from exhausting client memory. Bodies larger
+# than this cap are truncated; truncation surfaces as an observation warning.
+MAX_RESPONSE_BYTES = 1 * 1024 * 1024  # 1 MiB
+MARKER_COUNT = len(MARKERS)
+# Conservative default: only ENFORCED when nearly all markers show strong
+# enforcement evidence (>= 8 of 9). Bias toward underclaiming.
+ENFORCED_STRONG_THRESHOLD = 8
+
+EVIDENCE_BASIS = {
+    "uses_private_configuration": False,
+    "uses_provider_api": False,
+    "uses_origin_logs": False,
+    "baseline_source": "same_scan_benign_probes_following_bounded_redirect_policy",
+    "classification_signals": [
+        "status_code",
+        "cf_mitigated_header",
+        "same_scan_baseline_status",
+        "redirect_integrity",
+        "transport_completion",
+    ],
+    "block_signal_policy": "http_403_without_challenge_auth_retry_or_login_header",
+    "audit_metadata_not_used_for_verdict": [
+        "body_length",
+        "body_sha256",
+    ],
+}
+
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+# Response headers retained for classification/audit (lowercase, WAF-relevant).
+CAPTURED_RESPONSE_HEADERS = frozenset(
+    {
+        "server",
+        "content-type",
+        "content-length",
+        "cache-control",
+        "location",
+        "via",
+        "x-cache",
+        "x-cache-status",
+        "cf-cache-status",
+        "cf-mitigated",
+        "retry-after",
+        "www-authenticate",
+    }
+)
+
+# Cloudflare-specific challenge indicator. Documented limitation: non-Cloudflare
+# challenge mechanisms mostly fall through to BLOCK (still "enforced").
+CHALLENGE_HEADER = "cf-mitigated"
+CHALLENGE_TOKENS = ("challenge", "managed_challenge", "js_challenge")
+
+SCOPE_WARNING = (
+    "WAFstat checks externally observable enforcement consequence for marker "
+    "traffic. It does not detect WAF presence and does not infer private WAF "
+    "internal state. Origin-like pass-through cannot distinguish detect-only "
+    "from no-WAF."
+)
+
+AUTHORIZED_USE_NOTICE = (
+    "Use only on systems you own or are explicitly authorized to assess. "
+    "The operator is responsible for the supplied target and every redirect "
+    "destination they choose to follow."
+)
+
+CROSS_HOST_AUTH_NOTICE = (
+    "Cross-host redirect following is enabled. Confirm authorization covers "
+    "every redirect destination before continuing."
+)
+
+# Verdict enumerations.
+POSTURE_ENFORCED = "ENFORCED"
+POSTURE_NOT_ENFORCED = "NOT_ENFORCED_OBSERVED"
+POSTURE_INCONCLUSIVE = "INCONCLUSIVE"
+
+ACTION_BLOCK = "BLOCK"
+ACTION_CHALLENGE = "CHALLENGE"
+ACTION_PASS_THROUGH = "PASS_THROUGH"  # noqa: S105
+ACTION_MIXED = "MIXED"
+ACTION_RUNTIME_FAILURE = "RUNTIME_FAILURE"
+ACTION_OTHER = "OTHER"
+# Only the default, externally block-like status is treated as a block signal.
+# Other 4xx/5xx statuses can be application/auth/rate-limit/upstream errors.
+BLOCK_LIKE_STATUSES = frozenset({403})
+NON_BLOCK_403_HEADERS = frozenset({"location", "retry-after", "www-authenticate"})
+
+# Exit codes.
+EXIT_OK = 0
+EXIT_SAFETY = 2
+
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*$"
+)
+
+
+# --- Errors -----------------------------------------------------------------
+
+
+class ScanURLError(ValueError):
+    """Raised when a target host/URL fails validation."""
+
+
+class ScanConfigError(ValueError):
+    """Raised when a request-profile / CLI option fails validation."""
+
+
+class ObservationSaveError(Exception):
+    """Raised when atomic observation/plan saving fails (path, permission, disk)."""
+
+
+class TransportFailure(Exception):
+    """Raised by an HTTP transport on a DNS/TLS/connection/socket failure."""
+
+
+class RedirectError(Exception):
+    """Raised on redirect loops or redirect-depth exhaustion."""
+
+
+class RedirectScopeError(RedirectError):
+    """Raised before a redirect destination outside the hostname scope is contacted."""
+
+    def __init__(self, blocked_redirect: Mapping[str, object]):
+        super().__init__("redirect_out_of_scope")
+        self.blocked_redirect = dict(blocked_redirect)
+
+
+# --- Transport primitives ---------------------------------------------------
+
+RawResponse = collections.namedtuple(
+    "RawResponse",
+    ["status", "headers", "body", "body_truncated"],
+    defaults=[False],
+)
+
+# A Transport does exactly one GET request and does NOT follow redirects.
+# Signature: transport(url: str, headers: Mapping[str, str], timeout: float)
+#   -> RawResponse
+# Tests inject fakes; the real transport uses urllib.
+Transport = Callable[[str, Mapping[str, str], float], RawResponse]
+
+
+def _bounded_read(stream, *, cap: int = MAX_RESPONSE_BYTES) -> tuple[bytes, bool]:
+    """Read at most ``cap`` bytes from a urllib response/error object.
+
+    Prevents a hostile or oversized response from exhausting client memory at
+    the urllib transport boundary.
+    """
+
+    data = bytearray()
+    # Read one sentinel byte beyond the retained cap so an exact-cap response
+    # is not falsely reported as truncated. The retained body is still capped.
+    read_limit = cap + 1
+    while len(data) < read_limit:
+        chunk = stream.read(min(65_536, read_limit - len(data)))
+        if not chunk:
+            break
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise TransportFailure("response stream returned non-bytes chunk")
+        data.extend(chunk)
+    return bytes(data[:cap]), len(data) > cap
+
+
+def _truncate_body(body: bytes, *, cap: int = MAX_RESPONSE_BYTES) -> tuple[bytes, bool]:
+    """Cap a response body to ``cap`` bytes. Returns (body, truncated)."""
+
+    if len(body) > cap:
+        return body[:cap], True
+    return body, False
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevents urllib from auto-following redirects; we capture the chain."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+def _lower_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    return {str(k).lower(): str(v) for k, v in headers.items()}
+
+
+def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> RawResponse:
+    """Real single-request GET transport (no redirect following).
+
+    Not exercised by the offline test suite: tests inject fake transports and
+    perform no real network activity.
+    """
+
+    request = urllib.request.Request(url, method="GET", headers=dict(headers))  # noqa: S310
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    try:
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310
+            body, body_truncated = _bounded_read(response)
+            return RawResponse(
+                status=int(response.status),
+                headers=_lower_headers(response.headers),
+                body=body,
+                body_truncated=body_truncated,
+            )
+    except urllib.error.HTTPError as exc:
+        # 3xx (redirect not followed) and 4xx/5xx arrive here.
+        body = b""
+        body_truncated = False
+        try:
+            body, body_truncated = _bounded_read(exc)
+        except Exception:  # pragma: no cover - defensive
+            body = b""
+        return RawResponse(
+            status=int(exc.code),
+            headers=_lower_headers(exc.headers or {}),
+            body=body,
+            body_truncated=body_truncated,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Transport/runtime failure; never treated as enforcement. Do not embed
+        # the request URL (marker-bearing) in the message.
+        raise TransportFailure(type(exc).__name__) from exc
+
+
+# --- URL / profile validation -----------------------------------------------
+
+
+def normalize_target(raw: str) -> tuple[str, str, str, str]:
+    """Validate and normalize a hostname or http(s) URL.
+
+    Returns (scheme, netloc, host, path). Rejects non-http(s) schemes and any
+    embedded credentials.
+    """
+
+    if not isinstance(raw, str):
+        raise ScanURLError("target must be a string")
+    candidate = raw.strip()
+    if not candidate:
+        raise ScanURLError("target must not be empty")
+    if "\r" in candidate or "\n" in candidate or any(c.isspace() for c in candidate):
+        raise ScanURLError("target must not contain whitespace or control characters")
+
+    if "://" in candidate:
+        parts = urllib.parse.urlsplit(candidate)
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ScanURLError(f"scheme must be http or https, got {scheme!r}")
+        if "@" in parts.netloc or parts.username or parts.password:
+            raise ScanURLError("credentials embedded in URL are not allowed")
+        host = parts.hostname
+        if not host:
+            raise ScanURLError("URL is missing a host")
+        _validate_host(host)
+        netloc = host if parts.port is None else f"{host}:{parts.port}"
+        path = parts.path or "/"
+        return scheme, netloc, host, path
+
+    # Bare hostname (optionally host:port and/or /path). Reject scheme-like
+    # inputs such as "javascript:alert(1)" (non-numeric port).
+    if "@" in candidate:
+        raise ScanURLError("credentials embedded in target are not allowed")
+    slash = candidate.find("/")
+    if slash == -1:
+        authority, path = candidate, "/"
+    else:
+        authority, path = candidate[:slash], candidate[slash:]
+    host = authority
+    port: str | None = None
+    if ":" in authority:
+        host, _, port = authority.partition(":")
+        if not port.isdigit():
+            raise ScanURLError(f"invalid scheme or host: {authority!r}")
+    _validate_host(host)
+    netloc = host if not port else f"{host}:{port}"
+    return "https", netloc, host, path or "/"
+
+
+def _validate_host(host: str) -> None:
+    if not host:
+        raise ScanURLError("empty host")
+    stripped = host.strip("[]")
+    # IPv6 literals are not supported in the first public scanner release because
+    # safe netloc reconstruction and redirect sanitization require bracket-aware
+    # handling. Reject explicitly rather than building malformed URLs.
+    if ":" in stripped:
+        raise ScanURLError("IPv6 literal targets are not supported in this release")
+    if _HOSTNAME_RE.match(host):
+        return
+    # Bare IPv4 already matches the hostname regex; anything else is invalid.
+    raise ScanURLError(f"invalid host: {host!r}")
+
+
+def build_request_profile(user_agent: str | None = None) -> dict[str, str]:
+    """Build the stable request profile. Only User-Agent may be overridden."""
+
+    if user_agent is None:
+        ua = DEFAULT_USER_AGENT
+    else:
+        ua = user_agent
+        if ua == "":
+            raise ScanConfigError("--user-agent must not be empty")
+        if "\r" in ua or "\n" in ua:
+            raise ScanConfigError("--user-agent must not contain CR or LF characters")
+    return {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
+
+
+# --- URL helpers -------------------------------------------------------------
+
+
+def _build_request_url(scheme: str, netloc: str, path: str, value: str) -> str:
+    query = urllib.parse.urlencode({MARKER_PARAMETER_NAME: value})
+    return urllib.parse.urlunsplit((scheme, netloc, path or "/", query, ""))
+
+
+def _url_decoded_variants(value: str, *, rounds: int = 4) -> set[str]:
+    """Return bounded raw/unquote/unquote-plus variants for leak detection."""
+
+    variants = {value}
+    frontier = {value}
+    for _ in range(rounds):
+        decoded: set[str] = set()
+        for item in frontier:
+            decoded.add(urllib.parse.unquote(item))
+            decoded.add(urllib.parse.unquote_plus(item))
+        decoded -= variants
+        if not decoded:
+            break
+        variants.update(decoded)
+        frontier = decoded
+    return variants
+
+
+def _contains_marker_representation(value: str) -> bool:
+    """Detect a marker in raw, plus-encoded, or repeatedly percent-encoded text."""
+
+    return any(
+        marker.marker_value in variant
+        for variant in _url_decoded_variants(value)
+        for marker in MARKERS
+    )
+
+
+def _sanitize_path(path: str) -> str:
+    if _contains_marker_representation(path):
+        return "/[redacted-marker-path]"
+    return path
+
+
+def _sanitize_url(url: str) -> str:
+    """Return scheme://host[:port]/path with query, fragment, credentials removed.
+
+    Query strings are stripped because they may carry marker values.
+    """
+
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
+    return urllib.parse.urlunsplit(
+        (parts.scheme, netloc, _sanitize_path(parts.path), "", "")
+    )
+
+
+def _sanitize_location(value: str) -> str:
+    """Sanitize an absolute or relative Location header for public metadata."""
+
+    try:
+        parts = urllib.parse.urlsplit(value)
+        if parts.scheme or parts.netloc:
+            return _sanitize_url(value)
+        return urllib.parse.urlunsplit(
+            ("", "", _sanitize_path(parts.path), "", "")
+        )
+    except ValueError:
+        return "[redacted-invalid-location]"
+
+
+def _host_of(url: str) -> str:
+    return urllib.parse.urlsplit(url).hostname or ""
+
+
+def _validate_redirect_url(url: str) -> None:
+    """Reject redirect destinations that are unsafe for the HTTP-only scanner."""
+
+    if "\r" in url or "\n" in url or any(c.isspace() for c in url):
+        raise RedirectError("redirect_invalid")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        host = parts.hostname
+        # Accessing port validates that a supplied port is numeric and in range.
+        _ = parts.port
+        if scheme not in ("http", "https"):
+            raise ValueError("non-http redirect")
+        if not host or "@" in parts.netloc or parts.username or parts.password:
+            raise ValueError("redirect credentials or host invalid")
+        _validate_host(host)
+    except (ScanURLError, ValueError) as exc:
+        raise RedirectError("redirect_invalid") from exc
+
+
+# --- Redirect-following fetch ------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    final: RawResponse
+    final_url: str
+    redirect_chain: tuple[dict[str, object], ...]
+    warnings: tuple[str, ...]
+
+
+def fetch(
+    url: str,
+    headers: Mapping[str, str],
+    timeout: float,
+    *,
+    transport: Transport,
+    max_redirects: int = MAX_REDIRECTS,
+    follow_cross_host_redirects: bool = False,
+) -> FetchResult:
+    """Follow redirects (capped) and return the final response with metadata.
+
+    Raises TransportFailure on transport errors and RedirectError on redirect
+    loops or redirect-depth exhaustion. Both are runtime/measurement failures,
+    never enforcement.
+    """
+
+    chain: list[dict[str, object]] = []
+    warnings: list[str] = []
+    visited = [_sanitize_url(url)]
+    current = url
+
+    for _ in range(max_redirects + 1):
+        raw = transport(current, headers, timeout)
+        norm_headers = _lower_headers(raw.headers)
+        location = norm_headers.get("location")
+        if raw.status in REDIRECT_STATUSES and location:
+            target = urllib.parse.urljoin(current, location)
+            _validate_redirect_url(target)
+            from_host = _host_of(current)
+            to_host = _host_of(target)
+            redirect_entry = {
+                "status": int(raw.status),
+                "from": _sanitize_url(current),
+                "to": _sanitize_url(target),
+            }
+            chain.append(redirect_entry)
+            if to_host and to_host != from_host:
+                if not follow_cross_host_redirects:
+                    raise RedirectScopeError(redirect_entry)
+                warnings.append(f"cross_host_redirect_followed:{from_host}->{to_host}")
+            sanitized_target = _sanitize_url(target)
+            if sanitized_target in visited:
+                raise RedirectError("redirect_loop")
+            visited.append(sanitized_target)
+            current = target
+            continue
+        return FetchResult(
+            final=RawResponse(
+                status=int(raw.status),
+                headers=norm_headers,
+                body=raw.body,
+                body_truncated=raw.body_truncated,
+            ),
+            final_url=current,
+            redirect_chain=tuple(chain),
+            warnings=tuple(warnings),
+        )
+    raise RedirectError("redirect_depth_exhausted")
+
+
+# --- Observations ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Observation:
+    kind: str  # "baseline" or "marker"
+    status_code: int
+    response_headers_subset: Mapping[str, str]
+    body_length: int
+    body_sha256: str
+    final_url: str
+    redirect_chain: tuple[dict[str, object], ...]
+    warnings: tuple[str, ...]
+    marker_id: str | None = None
+    marker_category: str | None = None
+    marker_value_hash: str | None = None
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "marker_id": self.marker_id,
+            "marker_category": self.marker_category,
+            "marker_value_hash": self.marker_value_hash,
+            "status_code": self.status_code,
+            "response_headers_subset": dict(self.response_headers_subset),
+            "body_length": self.body_length,
+            "body_sha256": self.body_sha256,
+            "final_url": self.final_url,
+            "redirect_chain": [dict(entry) for entry in self.redirect_chain],
+            "warnings": list(self.warnings),
+        }
+
+
+def _headers_subset(headers: Mapping[str, str]) -> dict[str, str]:
+    subset = {
+        k: v
+        for k, v in _lower_headers(headers).items()
+        if k in CAPTURED_RESPONSE_HEADERS
+    }
+    if "location" in subset:
+        subset["location"] = _sanitize_location(subset["location"])
+    if "www-authenticate" in subset:
+        subset["www-authenticate"] = "[present]"
+    if "retry-after" in subset:
+        subset["retry-after"] = "[present]"
+    return subset
+
+
+def _probe(
+    target: tuple[str, str, str, str],
+    value: str,
+    profile: Mapping[str, str],
+    timeout: float,
+    transport: Transport,
+    *,
+    marker: Marker | None,
+    follow_cross_host_redirects: bool = False,
+) -> Observation:
+    scheme, netloc, host, path = target
+    url = _build_request_url(scheme, netloc, path, value)
+    result = fetch(
+        url,
+        profile,
+        timeout,
+        transport=transport,
+        follow_cross_host_redirects=follow_cross_host_redirects,
+    )
+    raw = result.final
+    warnings = list(result.warnings)
+    # Marker preservation: if a marker request was redirected to a URL that no
+    # longer carries the marker parameter, note it (conservative traceability).
+    if marker is not None and result.redirect_chain:
+        final_query = urllib.parse.urlsplit(result.final_url).query
+        params = urllib.parse.parse_qs(final_query)
+        if MARKER_PARAMETER_NAME not in params:
+            warnings.append("marker_not_preserved_across_redirect")
+    # Response-body cap: bound memory use against hostile/large responses and
+    # surface truncation honestly as an observation warning.
+    capped_body, truncated = _truncate_body(raw.body)
+    truncated = truncated or raw.body_truncated
+    if truncated:
+        warnings.append("response_body_truncated")
+    return Observation(
+        kind="marker" if marker is not None else "baseline",
+        status_code=raw.status,
+        response_headers_subset=_headers_subset(raw.headers),
+        body_length=len(capped_body),
+        body_sha256=_sha256_bytes(capped_body),
+        final_url=_sanitize_url(result.final_url),
+        redirect_chain=result.redirect_chain,
+        warnings=tuple(warnings),
+        marker_id=marker.marker_id if marker else None,
+        marker_category=marker.marker_category if marker else None,
+        marker_value_hash=_marker_value_hash(marker) if marker else None,
+    )
+
+
+# --- Classification ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BaselineSignature:
+    status_codes: frozenset[int]
+    body_lengths: frozenset[int]
+    origin_like: bool
+
+
+def _build_baseline(baseline_obs: Sequence[Observation]) -> BaselineSignature:
+    statuses = frozenset(o.status_code for o in baseline_obs)
+    lengths = frozenset(o.body_length for o in baseline_obs)
+    origin_like = bool(baseline_obs) and all(200 <= o.status_code < 300 for o in baseline_obs)
+    return BaselineSignature(status_codes=statuses, body_lengths=lengths, origin_like=origin_like)
+
+
+def _is_challenge(obs: Observation) -> bool:
+    value = str(obs.response_headers_subset.get(CHALLENGE_HEADER, "")).strip().lower()
+    return any(token in value for token in CHALLENGE_TOKENS)
+
+
+def _marker_action(obs: Observation, baseline: BaselineSignature) -> str:
+    """Classify one marker observation conservatively.
+
+    Body hash is traceability only, never a standalone block signal.
+    """
+
+    if "marker_not_preserved_across_redirect" in obs.warnings:
+        return ACTION_OTHER
+    if _is_challenge(obs):
+        return ACTION_CHALLENGE
+    if (
+        obs.status_code in BLOCK_LIKE_STATUSES
+        and not NON_BLOCK_403_HEADERS.intersection(obs.response_headers_subset)
+    ):
+        return ACTION_BLOCK
+    if 200 <= obs.status_code < 300:
+        # Origin-like status. Differing body hashes/lengths alone are dynamic
+        # content, not enforcement.
+        return ACTION_PASS_THROUGH
+    return ACTION_OTHER
+
+
+@dataclass(frozen=True)
+class Verdict:
+    target: str
+    enforcement_posture: str
+    observed_enforcement_action: str
+    strong_signal_count: int
+    pass_through_count: int
+    marker_count: int
+    action_counts: Mapping[str, int]
+    marker_actions: tuple[Mapping[str, str], ...]
+    marker_ids_by_action: Mapping[str, tuple[str, ...]]
+    baseline_summary: str
+    evidence_summary: str
+    human_summary: str
+    warnings: tuple[str, ...]
+    observations: tuple[Observation, ...]
+    request_headers_intended: Mapping[str, str]
+    corpus_sha256: str = MARKER_CORPUS_SHA256
+    marker_corpus_version: str = MARKER_CORPUS_VERSION
+    error_kind: str | None = None
+    redirect_policy: str = "same-host-only"
+    follow_cross_host_redirects: bool = False
+    blocked_redirect: Mapping[str, object] | None = None
+
+    @property
+    def verdict_label(self) -> str:
+        return f"{self.enforcement_posture} / {self.observed_enforcement_action}"
+
+    def as_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "tool": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "timestamp_utc": _utc_now(),
+            "target": self.target,
+            "authorized_use_notice": AUTHORIZED_USE_NOTICE,
+            "marker_corpus_version": self.marker_corpus_version,
+            "corpus_sha256": self.corpus_sha256,
+            "request_headers_intended": dict(self.request_headers_intended),
+            "baseline_repetitions": len([o for o in self.observations if o.kind == "baseline"]),
+            "marker_count": self.marker_count,
+            "enforcement_posture": self.enforcement_posture,
+            "observed_enforcement_action": self.observed_enforcement_action,
+            "verdict": self.verdict_label,
+            "strong_signal_count": self.strong_signal_count,
+            "pass_through_count": self.pass_through_count,
+            "action_counts": dict(self.action_counts),
+            "marker_actions": [dict(item) for item in self.marker_actions],
+            "marker_ids_by_action": {
+                action: list(marker_ids)
+                for action, marker_ids in self.marker_ids_by_action.items()
+            },
+            "evidence_basis": dict(EVIDENCE_BASIS),
+            "enforcement_threshold": {
+                "minimum_strong_markers": ENFORCED_STRONG_THRESHOLD,
+                "marker_count": MARKER_COUNT,
+            },
+            "baseline_summary": self.baseline_summary,
+            "evidence_summary": self.evidence_summary,
+            "human_summary": self.human_summary,
+            "scope_warning": SCOPE_WARNING,
+            "warnings": list(self.warnings),
+            "error_kind": self.error_kind,
+            "redirect_policy": self.redirect_policy,
+            "follow_cross_host_redirects": self.follow_cross_host_redirects,
+            "blocked_redirect": (
+                dict(self.blocked_redirect) if self.blocked_redirect is not None else None
+            ),
+        }
+        payload["observations"] = [o.as_json() for o in self.observations]
+        return payload
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def classify(
+    target_display: str,
+    profile: Mapping[str, str],
+    observations: Sequence[Observation],
+    *,
+    follow_cross_host_redirects: bool = False,
+) -> Verdict:
+    baseline_obs = [o for o in observations if o.kind == "baseline"]
+    marker_obs = [o for o in observations if o.kind == "marker"]
+    baseline = _build_baseline(baseline_obs)
+    warnings: list[str] = []
+    for o in observations:
+        warnings.extend(o.warnings)
+
+    actions = [_marker_action(o, baseline) for o in marker_obs]
+    counts = collections.Counter(actions)
+    strong = counts.get(ACTION_BLOCK, 0) + counts.get(ACTION_CHALLENGE, 0)
+    pass_n = counts.get(ACTION_PASS_THROUGH, 0)
+    n = len(marker_obs)
+    marker_actions = tuple(
+        {
+            "marker_id": str(obs.marker_id),
+            "marker_category": str(obs.marker_category),
+            "observed_action": action,
+        }
+        for obs, action in zip(marker_obs, actions, strict=True)
+    )
+    ids_by_action: dict[str, list[str]] = collections.defaultdict(list)
+    for item in marker_actions:
+        ids_by_action[item["observed_action"]].append(item["marker_id"])
+
+    if 0 < strong < n:
+        warnings.append("partial_enforcement_evidence")
+    enforcement_actions = {
+        action for action in actions if action in {ACTION_BLOCK, ACTION_CHALLENGE}
+    }
+    if len(enforcement_actions) > 1:
+        warnings.append("heterogeneous_enforcement_actions")
+    if any(
+        obs.status_code == 403
+        and str(obs.response_headers_subset.get("server", "")).lower() == "cloudflare"
+        and not _is_challenge(obs)
+        and _marker_action(obs, baseline) == ACTION_BLOCK
+        for obs in marker_obs
+    ):
+        warnings.append("cloudflare_403_without_challenge_header")
+
+    baseline_summary = (
+        f"{sorted(baseline.status_codes)} status, "
+        f"lengths {sorted(baseline.body_lengths)} "
+        f"({'origin-like' if baseline.origin_like else 'not origin-like'})"
+    )
+
+    if not baseline.origin_like:
+        warnings.append("baseline_not_origin_like")
+        posture, action = POSTURE_INCONCLUSIVE, ACTION_MIXED
+        evidence = (
+            "Same-shape benign baseline was not consistently origin-like; a "
+            "defensible per-host reference could not be established."
+        )
+        human = (
+            "WAFstat could not establish an origin-like baseline for this target, "
+            "so no enforcement posture is assigned."
+        )
+    elif strong >= ENFORCED_STRONG_THRESHOLD:
+        posture = POSTURE_ENFORCED
+        action = next(iter(enforcement_actions)) if len(enforcement_actions) == 1 else ACTION_MIXED
+        action_detail = ", ".join(
+            f"{counts[name]} {name}" for name in (ACTION_BLOCK, ACTION_CHALLENGE) if counts.get(name)
+        )
+        evidence = f"{strong}/{n} marker observations produced externally observable enforcement ({action_detail})."
+        human = (
+            "Marker traffic produced externally visible enforcement behavior. "
+            "If a WAF is present on this path, this is consistent with active enforcement."
+        )
+    elif pass_n == n and n > 0:
+        posture, action = POSTURE_NOT_ENFORCED, ACTION_PASS_THROUGH
+        evidence = (
+            f"{pass_n}/{n} marker observations matched origin-like pass-through; "
+            "no external enforcement signal was observed."
+        )
+        human = (
+            "No external enforcement observed. If a WAF is present on this path, "
+            "this is consistent with detect-only/observe mode for this marker corpus."
+        )
+    else:
+        posture, action = POSTURE_INCONCLUSIVE, ACTION_MIXED
+        evidence = (
+            f"{strong}/{n} marker observations showed enforcement signals and "
+            f"{pass_n}/{n} matched pass-through; evidence is mixed or insufficient."
+        )
+        human = (
+            f"Partial external enforcement was observed for {strong}/{n} markers; "
+            "the scan remains inconclusive under the configured threshold."
+        )
+
+    if len(enforcement_actions) > 1 or 0 < strong < n:
+        action_id_summary = "; ".join(
+            f"{name}: {', '.join(ids_by_action[name])}"
+            for name in sorted(ids_by_action)
+        )
+        human += f" Marker IDs by observed action: {action_id_summary}."
+
+    # De-duplicate warnings while preserving order.
+    seen: set[str] = set()
+    ordered_warnings = tuple(w for w in warnings if not (w in seen or seen.add(w)))
+
+    return Verdict(
+        target=target_display,
+        enforcement_posture=posture,
+        observed_enforcement_action=action,
+        strong_signal_count=strong,
+        pass_through_count=pass_n,
+        marker_count=n,
+        action_counts=dict(sorted(counts.items())),
+        marker_actions=marker_actions,
+        marker_ids_by_action={key: tuple(value) for key, value in sorted(ids_by_action.items())},
+        baseline_summary=baseline_summary,
+        evidence_summary=evidence,
+        human_summary=human,
+        warnings=ordered_warnings,
+        observations=tuple(observations),
+        request_headers_intended=dict(profile),
+        redirect_policy=(
+            "follow-cross-host" if follow_cross_host_redirects else "same-host-only"
+        ),
+        follow_cross_host_redirects=follow_cross_host_redirects,
+    )
+
+
+def _runtime_failure_verdict(
+    target_display: str,
+    profile: Mapping[str, str],
+    error_kind: str,
+    observations: Sequence[Observation],
+    *,
+    follow_cross_host_redirects: bool = False,
+    blocked_redirect: Mapping[str, object] | None = None,
+) -> Verdict:
+    if error_kind == "REDIRECT_OUT_OF_SCOPE" and blocked_redirect is not None:
+        from_host = _host_of(str(blocked_redirect["from"]))
+        to_host = _host_of(str(blocked_redirect["to"]))
+        evidence_summary = (
+            f"The target redirected from {from_host} to {to_host}; the destination "
+            "was outside the default hostname scope and was not contacted."
+        )
+        human_summary = (
+            f"The target redirected from {from_host} to {to_host}. WAFstat did not "
+            "contact the destination host, so the scan is inconclusive. If every "
+            "redirect destination is authorized, rerun with "
+            "--follow-cross-host-redirects."
+        )
+    else:
+        evidence_summary = (
+            f"A runtime/transport failure ({error_kind}) prevented a defensible "
+            "classification. Runtime failures are never treated as enforcement."
+        )
+        human_summary = (
+            "WAFstat could not complete the scan due to a runtime/transport "
+            "failure. This is not evidence of enforcement."
+        )
+    return Verdict(
+        target=target_display,
+        enforcement_posture=POSTURE_INCONCLUSIVE,
+        observed_enforcement_action=ACTION_RUNTIME_FAILURE,
+        strong_signal_count=0,
+        pass_through_count=0,
+        marker_count=len([o for o in observations if o.kind == "marker"]),
+        action_counts={},
+        marker_actions=(),
+        marker_ids_by_action={},
+        baseline_summary="unavailable",
+        evidence_summary=evidence_summary,
+        human_summary=human_summary,
+        warnings=(error_kind,),
+        observations=tuple(observations),
+        request_headers_intended=dict(profile),
+        error_kind=error_kind,
+        redirect_policy=(
+            "follow-cross-host" if follow_cross_host_redirects else "same-host-only"
+        ),
+        follow_cross_host_redirects=follow_cross_host_redirects,
+        blocked_redirect=blocked_redirect,
+    )
+
+
+# --- Scan orchestration ------------------------------------------------------
+
+
+def run_scan(
+    target: tuple[str, str, str, str],
+    profile: Mapping[str, str],
+    *,
+    transport: Transport,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    baseline_repetitions: int = DEFAULT_BASELINE_REPETITIONS,
+    follow_cross_host_redirects: bool = False,
+) -> Verdict:
+    """Run the live scan protocol: baseline probes, marker probes, classify."""
+
+    scheme, netloc, host, path = target
+    target_display = f"{scheme}://{netloc}{path if path != '/' else '/'}"
+    observations: list[Observation] = []
+    try:
+        for _ in range(baseline_repetitions):
+            observations.append(
+                _probe(
+                    target,
+                    BENIGN_BASELINE_VALUE,
+                    profile,
+                    timeout,
+                    transport,
+                    marker=None,
+                    follow_cross_host_redirects=follow_cross_host_redirects,
+                )
+            )
+        for marker in MARKERS:
+            observations.append(
+                _probe(
+                    target,
+                    marker.marker_value,
+                    profile,
+                    timeout,
+                    transport,
+                    marker=marker,
+                    follow_cross_host_redirects=follow_cross_host_redirects,
+                )
+            )
+    except (TransportFailure, RedirectError) as exc:
+        error_kind = _error_kind(exc)
+        return _runtime_failure_verdict(
+            target_display,
+            profile,
+            error_kind,
+            observations,
+            follow_cross_host_redirects=follow_cross_host_redirects,
+            blocked_redirect=(
+                exc.blocked_redirect if isinstance(exc, RedirectScopeError) else None
+            ),
+        )
+    return classify(
+        target_display,
+        profile,
+        observations,
+        follow_cross_host_redirects=follow_cross_host_redirects,
+    )
+
+
+def _error_kind(exc: Exception) -> str:
+    if isinstance(exc, RedirectError):
+        return str(exc).upper()
+    return f"TRANSPORT_ERROR:{type(exc).__name__}"
+
+
+# --- Marker-safety guard -----------------------------------------------------
+
+
+def assert_marker_safe(text: str) -> None:
+    """Raise if raw, escaped, or URL-encoded markers leaked into output text."""
+
+    leaked: list[str] = []
+    decoded_variants = _url_decoded_variants(text)
+    for marker in MARKERS:
+        encoded_forms = {
+            marker.marker_value,
+            json.dumps(marker.marker_value),
+            json.dumps(marker.marker_value)[1:-1],
+        }
+        if any(
+            form and form in variant
+            for variant in decoded_variants
+            for form in encoded_forms
+        ):
+            leaked.append(marker.marker_id)
+    if leaked:
+        raise ScanConfigError(f"raw marker values must never be persisted: {leaked}")
+
+
+# --- Dry-run plan ------------------------------------------------------------
+
+
+def build_dry_run_plan(
+    target: tuple[str, str, str, str],
+    profile: Mapping[str, str],
+    *,
+    baseline_repetitions: int = DEFAULT_BASELINE_REPETITIONS,
+    follow_cross_host_redirects: bool = False,
+) -> dict[str, object]:
+    scheme, netloc, host, path = target
+    return {
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "timestamp_utc": _utc_now(),
+        "mode": "dry-run",
+        "network_activity": "none",
+        "target": f"{scheme}://{netloc}{path}",
+        "authorized_use_notice": AUTHORIZED_USE_NOTICE,
+        "marker_corpus_version": MARKER_CORPUS_VERSION,
+        "corpus_sha256": MARKER_CORPUS_SHA256,
+        "marker_count": MARKER_COUNT,
+        "marker_ids": [m.marker_id for m in MARKERS],
+        "marker_categories": list(MARKER_CATEGORIES),
+        "baseline_repetitions": baseline_repetitions,
+        "planned_request_count": baseline_repetitions + MARKER_COUNT,
+        "maximum_transport_requests": (
+            (baseline_repetitions + MARKER_COUNT) * (MAX_REDIRECTS + 1)
+        ),
+        "request_profile": f"{TOOL_NAME}/{TOOL_VERSION}-default",
+        "request_headers_intended": dict(profile),
+        "marker_parameter_name": MARKER_PARAMETER_NAME,
+        "marker_placement": MARKER_PLACEMENT,
+        "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+        "max_redirects": MAX_REDIRECTS,
+        "redirect_policy": (
+            "follow-cross-host" if follow_cross_host_redirects else "same-host-only"
+        ),
+        "follow_cross_host_redirects": follow_cross_host_redirects,
+        "blocked_redirect": None,
+        "enforcement_threshold": {
+            "minimum_strong_markers": ENFORCED_STRONG_THRESHOLD,
+            "marker_count": MARKER_COUNT,
+        },
+        "evidence_basis": dict(EVIDENCE_BASIS),
+        "scope_warning": SCOPE_WARNING,
+    }
+
+
+# --- Rendering ---------------------------------------------------------------
+
+
+def render_dry_run(plan: Mapping[str, object]) -> str:
+    lines = [
+        f"{TOOL_NAME} {TOOL_VERSION}",
+        "mode: dry-run",
+        "network_activity: none",
+        f"target: {plan['target']}",
+        f"authorized_use_notice: {plan['authorized_use_notice']}",
+        f"marker_corpus_version: {plan['marker_corpus_version']}",
+        f"corpus_sha256: {plan['corpus_sha256']}",
+        f"marker_count: {plan['marker_count']}",
+        "marker_ids: " + ",".join(plan["marker_ids"]),  # type: ignore[arg-type]
+        "marker_categories: " + ",".join(plan["marker_categories"]),  # type: ignore[arg-type]
+        f"marker_parameter_name: {plan['marker_parameter_name']}",
+        f"baseline_repetitions: {plan['baseline_repetitions']}",
+        f"planned_request_count: {plan['planned_request_count']}",
+        f"maximum_transport_requests: {plan['maximum_transport_requests']}",
+        f"request_profile: {plan['request_profile']}",
+        "request_headers_intended:",
+    ]
+    for key, value in plan["request_headers_intended"].items():  # type: ignore[union-attr]
+        lines.append(f"  {key}: {value}")
+    lines.append(f"timeout_seconds: {plan['timeout_seconds']:g}")
+    lines.append(f"max_redirects: {plan['max_redirects']}")
+    lines.append(f"redirect_policy: {plan['redirect_policy']}")
+    threshold = plan["enforcement_threshold"]
+    lines.append(
+        "enforcement_threshold: "
+        f"{threshold['minimum_strong_markers']}/{threshold['marker_count']}"  # type: ignore[index]
+    )
+    evidence = plan["evidence_basis"]
+    lines.append(f"uses_private_configuration: {str(evidence['uses_private_configuration']).lower()}")  # type: ignore[index]
+    lines.append(f"uses_provider_api: {str(evidence['uses_provider_api']).lower()}")  # type: ignore[index]
+    lines.append(f"uses_origin_logs: {str(evidence['uses_origin_logs']).lower()}")  # type: ignore[index]
+    lines.append(f"scope_warning: {plan['scope_warning']}")
+    return "\n".join(lines)
+
+
+def render_verdict(verdict: Verdict) -> str:
+    lines = [
+        f"{TOOL_NAME} {TOOL_VERSION}",
+        f"  Target:   {verdict.target}",
+        f"  Baseline: {verdict.baseline_summary}",
+    ]
+    if verdict.error_kind is None:
+        lines.append(
+            f"  Markers:  {verdict.strong_signal_count}/{verdict.marker_count} strong enforcement, "
+            f"{verdict.pass_through_count}/{verdict.marker_count} pass-through"
+        )
+    lines.append(f"  Verdict:  {verdict.verdict_label}")
+    if verdict.error_kind is not None:
+        lines.append(f"  Reason:   {verdict.error_kind}")
+    lines.append(f"            {verdict.human_summary}")
+    if verdict.warnings:
+        lines.append("  Warnings: " + ", ".join(verdict.warnings))
+    lines.append(f"  Note:     {SCOPE_WARNING}")
+    return "\n".join(lines)
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wafstat",
+        description=(
+            "WAFstat live enforcement-verification scanner. Verifies whether a "
+            "fixed marker corpus produces externally observable WAF enforcement "
+            "on an authorized target. Not a fingerprinting or bypass tool. "
+            + AUTHORIZED_USE_NOTICE
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    scan = sub.add_parser(
+        "scan",
+        help="Scan a single authorized host.",
+        description=(
+            "Send the bounded WAFstat marker protocol to one authorized host. "
+            + AUTHORIZED_USE_NOTICE
+        ),
+    )
+    scan.add_argument("host", help="Hostname or http(s) URL of the authorized target.")
+    scan.add_argument("--dry-run", action="store_true", help="Show the plan and send no traffic.")
+    scan.add_argument(
+        "--follow-cross-host-redirects",
+        action="store_true",
+        help=(
+            "Follow redirects to different hostnames. Use only when every "
+            "redirect destination is authorized; same-host redirects are followed "
+            "by default."
+        ),
+    )
+    scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    scan.add_argument("--save-observations", metavar="PATH", help="Write bodyless, marker-safe observations/verdict to PATH.")
+    scan.add_argument("--user-agent", metavar="VALUE", help="Override the default User-Agent (non-empty, no CR/LF).")
+    return parser
+
+
+def _emit(payload: object, *, as_json: bool, text: str) -> None:
+    if as_json:
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+        assert_marker_safe(rendered)
+        print(rendered)
+    else:
+        assert_marker_safe(text)
+        print(text)
+
+
+def _save(path: str, payload: Mapping[str, object]) -> None:
+    """Write payload to ``path`` atomically: temp file + os.replace.
+
+    Leaving no partial file on interrupt/failure and ensuring the destination
+    only ever contains a complete JSON document.
+    """
+
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    assert_marker_safe(text)
+    dest = os.path.abspath(path)
+    dest_dir = os.path.dirname(dest) or "."
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".wafstat-", suffix=".tmp", dir=dest_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+        os.replace(tmp_name, dest)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_name)
+        except (OSError, UnboundLocalError):
+            pass
+        raise ObservationSaveError(f"could not write observations to {dest!r}") from exc
+
+
+def main(argv: list[str] | None = None, *, transport: Transport | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.command != "scan":  # pragma: no cover - argparse enforces this
+        parser.error("unknown command")
+
+    try:
+        target = normalize_target(args.host)
+        profile = build_request_profile(args.user_agent)
+    except (ScanURLError, ScanConfigError) as exc:
+        print(f"wafstat error: {exc}", file=sys.stderr)
+        return EXIT_SAFETY
+
+    if args.dry_run:
+        plan = build_dry_run_plan(
+            target,
+            profile,
+            follow_cross_host_redirects=args.follow_cross_host_redirects,
+        )
+        _emit(plan, as_json=args.json, text=render_dry_run(plan))
+        if args.save_observations:
+            try:
+                _save(args.save_observations, plan)
+            except ObservationSaveError as exc:
+                print(f"wafstat error: {exc}", file=sys.stderr)
+                return EXIT_SAFETY
+        return EXIT_OK
+
+    print(AUTHORIZED_USE_NOTICE, file=sys.stderr)
+    if args.follow_cross_host_redirects:
+        print(CROSS_HOST_AUTH_NOTICE, file=sys.stderr)
+    active_transport = transport if transport is not None else urllib_transport
+    verdict = run_scan(
+        target,
+        profile,
+        transport=active_transport,
+        follow_cross_host_redirects=args.follow_cross_host_redirects,
+    )
+    _emit(verdict.as_json(), as_json=args.json, text=render_verdict(verdict))
+    if args.save_observations:
+        try:
+            _save(args.save_observations, verdict.as_json())
+        except ObservationSaveError as exc:
+            print(f"wafstat error: {exc}", file=sys.stderr)
+            return EXIT_SAFETY
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
