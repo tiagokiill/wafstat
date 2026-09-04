@@ -1,0 +1,36 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local dependency environments
+.venv/
+venv/
+
+# Local helper binaries and directories
+/tools/
+
+# Hermes workspace metadata
+/.hermes/
+
+# Local scanner output and security reports
+*.jsonl
+*.sarif
+coverage.xml
+.coverage
+htmlcov/
+
+# Secrets and local environment
+.env
+.env.*
+*.secret
+*.token
+*.pem
+*.key
+
+# Editors and OS
+.DS_Store
+*.swp
+*.tmp

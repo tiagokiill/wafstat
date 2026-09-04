@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "External Verification of WAF Enforcement Posture: Measuring Observable WAF Enforcement Beyond Presence Fingerprinting"
+message: "If you use WAFstat in academic or professional work, please cite the accompanying white paper and this software artifact."
+type: software
+authors:
+  - given-names: "Tiago"
+    family-names: "Kiill"
+abstract: >-
+  WAFstat is a lightweight external enforcement-verification tool for authorized WAF assessment. It reports externally observable enforcement consequences of a fixed marker corpus and does not claim WAF presence or private WAF internal state.
+keywords:
+  - web application firewall
+  - WAF
+  - external verification
+  - enforcement posture
+  - security measurement
+license: MIT
+version: "0.4.0"
