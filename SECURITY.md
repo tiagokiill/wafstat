@@ -8,9 +8,12 @@ control without review.
 
 ## Reporting a vulnerability
 
-Do not disclose suspected vulnerabilities in public issues. Until a
-repository-specific security contact is published, use the private contact
-channel associated with the repository account. Include:
+Do not disclose suspected vulnerabilities in public issues. Report suspected
+vulnerabilities privately through GitHub Private Vulnerability Reporting:
+
+https://github.com/tiagokiill/wafstat/security/advisories/new
+
+This reporting path is available because the repository is public. Include:
 
 - affected version or commit;
 - exact reproduction steps that do not target third-party systems;
