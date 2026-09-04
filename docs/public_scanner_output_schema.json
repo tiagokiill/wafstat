@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://wafstat.example.invalid/schemas/public-scanner-output-v0.4.json",
+  "$id": "https://raw.githubusercontent.com/tiagokiill/wafstat/v0.4.0/docs/public_scanner_output_schema.json",
   "title": "WAFstat public scanner output",
   "description": "Bodyless, marker-safe dry-run or live verdict output for the WAFstat public scanner. Raw marker values, response bodies, and full marker-bearing URLs are intentionally not represented.",
   "oneOf": [

@@ -1862,7 +1862,10 @@ def test_output_schema_and_dry_run_example_track_v04_contract():
     example = json.loads((repo / "examples/wafstat_dry_run_example.json").read_text(encoding="utf-8"))
 
     common = schema["$defs"]["common"]
-    assert schema["$id"].endswith("public-scanner-output-v0.4.json")
+    assert schema["$id"] == (
+        "https://raw.githubusercontent.com/tiagokiill/wafstat/"
+        "v0.4.0/docs/public_scanner_output_schema.json"
+    )
     assert common["properties"]["tool_version"]["const"] == "0.4"
     assert "authorization_acknowledged" not in common["properties"]
     assert "authorized_use_notice" in common["required"]

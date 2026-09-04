@@ -7,7 +7,7 @@ All notable changes to the standalone WAFstat scanner are documented here.
 - Prepared a focused public distribution of the standard-library-only scanner.
 - Preserved the v0.4 output and classification contract.
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-09-04
 
 - Versioned the classification and output-contract hardening as 0.4.0.
 - Added atomic observation writes, bounded response handling, strict output

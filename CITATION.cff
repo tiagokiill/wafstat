@@ -14,4 +14,6 @@ keywords:
   - enforcement posture
   - security measurement
 license: MIT
+repository-code: "https://github.com/tiagokiill/wafstat"
+url: "https://github.com/tiagokiill/wafstat"
 version: "0.4.0"
